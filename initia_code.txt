@@ -1,0 +1,208 @@
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+
+// HARDWARE SETTINGS & THRESHOLDS
+#define MOTOR_PIN 15 // Pin connected to your vibration motor (use a transistor!)
+
+const float HYPEREXTENSION_THRESHOLD = -5.0; // Degrees
+const float FLEXION_THRESHOLD = 130.0;       // Degrees
+const float WOBBLE_THRESHOLD = 15.0;         // Degrees of sudden lateral roll difference
+
+// SENSOR OBJECTS & VARIABLES
+Adafruit_MPU6050 thighIMU;
+Adafruit_MPU6050 calfIMU;
+
+// Timing for Complementary Filter
+unsigned long lastTime = 0;
+float alpha = 0.98; // Trust gyro 98% of the time, accel 2%
+
+// Filtered Angles
+float thighPitch = 0, thighRoll = 0;
+float calfPitch = 0, calfRoll = 0;
+
+// BLE SETTINGS
+BLEServer* pServer = NULL;
+BLECharacteristic* pAngleCharacteristic = NULL;
+BLECharacteristic* pWobbleCharacteristic = NULL;
+bool deviceConnected = false;
+
+// Generate unique UUIDs (You can generate your own using uuidgenerator.net)
+#define SERVICE_UUID           "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define ANGLE_CHAR_UUID        "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+#define WOBBLE_CHAR_UUID       "829141b2-1111-45d2-a728-1b9185a676b7"
+
+// BLE Callbacks to manage connection state
+class MyServerCallbacks: public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) {
+      deviceConnected = true;
+    };
+    void onDisconnect(BLEServer* pServer) {
+      deviceConnected = false;
+    }
+};
+
+// SETUP
+void setup() {
+  Serial.begin(115200);
+  pinMode(MOTOR_PIN, OUTPUT);
+  digitalWrite(MOTOR_PIN, LOW);
+
+  Wire.begin();
+
+  // Initialize Thigh IMU (Default Address: 0x68)
+  if (!thighIMU.begin(0x68)) {
+    Serial.println("Failed to find Thigh MPU6050 (0x68)");
+    while (1) { delay(10); }
+  }
+  
+  // Initialize Calf IMU (Address: 0x69 - AD0 pin pulled HIGH)
+  if (!calfIMU.begin(0x69)) {
+    Serial.println("Failed to find Calf MPU6050 (0x69)");
+    while (1) { delay(10); }
+  }
+
+  // Setup IMU ranges for athletic movement
+  thighIMU.setAccelerometerRange(MPU6050_RANGE_8_G);
+  thighIMU.setGyroRange(MPU6050_RANGE_500_DEG);
+  calfIMU.setAccelerometerRange(MPU6050_RANGE_8_G);
+  calfIMU.setGyroRange(MPU6050_RANGE_500_DEG);
+
+  // Initialize BLE
+  BLEDevice::init("Smart_ACL_Brace");
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+
+  pAngleCharacteristic = pService->createCharacteristic(
+                           ANGLE_CHAR_UUID,
+                           BLECharacteristic::PROPERTY_READ   |
+                           BLECharacteristic::PROPERTY_NOTIFY
+                         );
+  pAngleCharacteristic->addDescriptor(new BLE2902());
+
+  pWobbleCharacteristic = pService->createCharacteristic(
+                            WOBBLE_CHAR_UUID,
+                            BLECharacteristic::PROPERTY_READ   |
+                            BLECharacteristic::PROPERTY_NOTIFY
+                          );
+  pWobbleCharacteristic->addDescriptor(new BLE2902());
+
+  pService->start();
+  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->setScanResponse(false);
+  pAdvertising->setMinPreferred(0x0);
+  BLEDevice::startAdvertising();
+  
+  Serial.println("Brace Initialized. Waiting for BLE connection...");
+  lastTime = millis();
+}
+
+// MAIN LOOP
+void loop() {
+  // 1. Calculate time delta (dt) in seconds
+  unsigned long currentTime = millis();
+  float dt = (currentTime - lastTime) / 1000.0;
+  lastTime = currentTime;
+
+  // 2. Read raw data from both sensors
+  sensors_event_t t_a, t_g, t_temp;
+  sensors_event_t c_a, c_g, c_temp;
+  thighIMU.getEvent(&t_a, &t_g, &t_temp);
+  calfIMU.getEvent(&c_a, &c_g, &c_temp);
+
+  // 3. Calculate Accelerometer Angles (Pitch & Roll)
+  float t_accelPitch = atan2(t_a.acceleration.y, sqrt(pow(t_a.acceleration.x, 2) + pow(t_a.acceleration.z, 2))) * 180 / PI;
+  float t_accelRoll  = atan2(-t_a.acceleration.x, t_a.acceleration.z) * 180 / PI;
+  
+  float c_accelPitch = atan2(c_a.acceleration.y, sqrt(pow(c_a.acceleration.x, 2) + pow(c_a.acceleration.z, 2))) * 180 / PI;
+  float c_accelRoll  = atan2(-c_a.acceleration.x, c_a.acceleration.z) * 180 / PI;
+
+  // 4. Apply Complementary Filter
+  // Convert rad/s to deg/s for gyro readings
+  thighPitch = alpha * (thighPitch + (t_g.gyro.x * 180 / PI) * dt) + (1 - alpha) * t_accelPitch;
+  thighRoll  = alpha * (thighRoll  + (t_g.gyro.y * 180 / PI) * dt) + (1 - alpha) * t_accelRoll;
+
+  calfPitch = alpha * (calfPitch + (c_g.gyro.x * 180 / PI) * dt) + (1 - alpha) * c_accelPitch;
+  calfRoll  = alpha * (calfRoll  + (c_g.gyro.y * 180 / PI) * dt) + (1 - alpha) * c_accelRoll;
+
+  // 5. Calculate Knee Metrics
+  // Assuming both sensors are mounted facing the same direction. 
+  // You may need to invert one depending on your physical mounting.
+  float kneeAngle = thighPitch - calfPitch; 
+  float wobbleIndex = abs(thighRoll - calfRoll); 
+
+  // 6. "Danger Zone" Logic & Haptics
+  bool danger = false;
+  
+  if (kneeAngle < HYPEREXTENSION_THRESHOLD) {
+    Serial.println("ALERT: Hyperextension!");
+    triggerHaptic(1); // Long pulse
+    danger = true;
+  } 
+  else if (kneeAngle > FLEXION_THRESHOLD) {
+    Serial.println("WARNING: Deep Flexion!");
+    triggerHaptic(2); // Double pulse
+    danger = true;
+  }
+  else if (wobbleIndex > WOBBLE_THRESHOLD) {
+    Serial.println("ALERT: High Lateral Wobble (Valgus)!");
+    triggerHaptic(3); // Rapid pulsing
+    danger = true;
+  }
+
+  // 7. Send Data via BLE
+  if (deviceConnected) {
+    // Convert floats to strings to send over BLE
+    char angleStr[8];
+    char wobbleStr[8];
+    dtostrf(kneeAngle, 1, 2, angleStr);
+    dtostrf(wobbleIndex, 1, 2, wobbleStr);
+
+    pAngleCharacteristic->setValue(angleStr);
+    pAngleCharacteristic->notify();
+
+    pWobbleCharacteristic->setValue(wobbleStr);
+    pWobbleCharacteristic->notify();
+  }
+
+  // Debug output
+  Serial.print("Knee Angle: "); Serial.print(kneeAngle);
+  Serial.print(" | Wobble: "); Serial.println(wobbleIndex);
+
+  delay(20); // Run at roughly 50Hz
+}
+
+// HAPTIC FEEDBACK PATTERNS
+void triggerHaptic(int pattern) {
+  switch(pattern) {
+    case 1: // Hyperextension: One long warning vibration
+      digitalWrite(MOTOR_PIN, HIGH);
+      delay(500);
+      digitalWrite(MOTOR_PIN, LOW);
+      break;
+    case 2: // Deep Flexion: Quick double pulse
+      digitalWrite(MOTOR_PIN, HIGH);
+      delay(100);
+      digitalWrite(MOTOR_PIN, LOW);
+      delay(100);
+      digitalWrite(MOTOR_PIN, HIGH);
+      delay(100);
+      digitalWrite(MOTOR_PIN, LOW);
+      break;
+    case 3: // Wobble/Valgus: Rapid buzzing
+      for(int i = 0; i < 3; i++) {
+        digitalWrite(MOTOR_PIN, HIGH);
+        delay(50);
+        digitalWrite(MOTOR_PIN, LOW);
+        delay(50);
+      }
+      break;
+  }
+}
